@@ -1,0 +1,20 @@
+# Data
+stock_daily_data/
+stock_daily_data.zip
+data/
+futures_options_daily_data/
+
+# Model weights
+Kronos-mini/
+Kronos-Tokenizer-2k/
+Kronos-Tokenizer-base/
+
+# Secrets
+api_key.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude
+.claude/
