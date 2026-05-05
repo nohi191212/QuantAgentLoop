@@ -58,7 +58,6 @@ def build_one_window(ws):
         train_n = min(n, 100000)
         print(f"    训练 IVF (nlist={nlist}, train={train_n})...")
         index.train(vectors[:train_n])
-        index.add(vectors)
         print(f"    nprobe 设为 32")
         index.nprobe = 32
 

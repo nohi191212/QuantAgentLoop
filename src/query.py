@@ -52,14 +52,14 @@ class SimilarityEngine:
         返回: dict
         """
         # 1. 获取该股票最近一个 N 周窗口的向量
-        from encoders.handcraft import HandcraftEncoder
+        from encoders.kronos_encoder import KronosEncoder
         from preprocess import load_and_clean, assign_iso_week, make_windows
 
         csv_path = os.path.join(STOCK_DATA_DIR, f"{ts_code}.csv")
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"股票数据不存在: {csv_path}")
 
-        encoder = HandcraftEncoder()
+        encoder = KronosEncoder(device='cpu')
         df = load_and_clean(csv_path)
         df = assign_iso_week(df)
 
@@ -77,7 +77,7 @@ class SimilarityEngine:
                 df_arr[c] = np.nan
         arr = df_arr[ENCODER_COLS].to_numpy(dtype=np.float32)
         win_arr = arr[start_idx: end_idx + 1]
-        query_vec = encoder.encode(win_arr).reshape(1, -1).astype(np.float32)
+        query_vec = encoder.encode([win_arr]).reshape(1, -1).astype(np.float32)
 
         if np.isnan(query_vec).any():
             raise ValueError("查询向量含 NaN")
@@ -126,6 +126,7 @@ class SimilarityEngine:
                 break
 
         # 4. 汇总分析
+        print(f"[DEBUG] 实际匹配数: {len(matches)}, 请求top_k: {top_k}, 索引总量: {self.index.ntotal}")
         summary = self._summarize(matches)
 
         return {
@@ -140,8 +141,10 @@ class SimilarityEngine:
         }
 
     def _summarize(self, matches):
-        """按 TOP-K 分组统计未来收益"""
-        groups = {"top10": 10, "top20": 20, "top50": 50, "top100": 100}
+        """按 TOP-K 分组统计未来收益，只统计不超过实际匹配数的分组"""
+        all_groups = {"top10": 10, "top20": 20, "top50": 50, "top100": 100}
+        n = len(matches)
+        groups = {name: k for name, k in all_groups.items() if k <= n}
         summary = {}
 
         for name, k in groups.items():
@@ -213,6 +216,111 @@ class SimilarityEngine:
         for m in result["top_matches"][:10]:
             print(f"    {m['rank']:>3}. {m['ts_code']:<12} {m['period']:<24}  sim={m['cosine_sim']:.4f}")
         print("=" * 70)
+
+        # 生成可视化
+        self._plot(result)
+
+    def _plot(self, result):
+        """生成收益分布可视化，保存到 output/ 目录"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.ticker as ticker
+        except ImportError:
+            print("[WARN] matplotlib 未安装，跳过可视化")
+            return
+
+        # 尝试设置中文字体
+        for font_name in ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC']:
+            try:
+                matplotlib.font_manager.findfont(font_name, fallback_to_default=False)
+                plt.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans']
+                plt.rcParams['axes.unicode_minus'] = False
+                break
+            except Exception:
+                continue
+
+        q = result["query"]
+        s = result["summary"]
+        matches = result["top_matches"]
+        groups = list(s.keys())
+        if not groups or not matches:
+            return
+
+        save_dir = os.path.join(PROJECT_DIR, "output")
+        os.makedirs(save_dir, exist_ok=True)
+
+        days = [1, 2, 3, 5, 10, 15, 20, 30]
+        colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(groups)))
+
+        # ---- Figure 1: 收益曲线 + 胜率曲线 ----
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        for i, group_name in enumerate(groups):
+            stats = s[group_name]
+            avg_rets = [stats.get(f"avg_ret_{d}d", np.nan) for d in days]
+            win_rates = [stats.get(f"win_rate_{d}d", np.nan) for d in days]
+
+            ax1.plot(days, [r * 100 for r in avg_rets], 'o-', color=colors[i],
+                     label=group_name, linewidth=1.5, markersize=5)
+            ax2.plot(days, [w * 100 for w in win_rates], 'o-', color=colors[i],
+                     label=group_name, linewidth=1.5, markersize=5)
+
+        ax1.axhline(y=0, color='gray', linestyle='--', linewidth=0.8)
+        ax1.set_xlabel('Holding Days')
+        ax1.set_ylabel('Avg Return (%)')
+        ax1.set_title(f'Avg Return by Holding Period\n{q["ts_code"]} ({q["window_size"]}W)')
+        ax1.legend(fontsize=8)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xticks(days)
+
+        ax2.axhline(y=50, color='gray', linestyle='--', linewidth=0.8)
+        ax2.set_xlabel('Holding Days')
+        ax2.set_ylabel('Win Rate (%)')
+        ax2.set_title('Win Rate by Holding Period')
+        ax2.legend(fontsize=8)
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xticks(days)
+
+        plt.tight_layout()
+        curve_path = os.path.join(save_dir, f"{q['ts_code']}_{q['window_size']}w_curves.png")
+        fig.savefig(curve_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"\n收益曲线: {curve_path}")
+
+        # ---- Figure 2: 收益分布直方图 ----
+        largest_group = groups[-1]
+        top_k = int(largest_group.replace('top', ''))
+        subset = matches[:top_k]
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        plot_days = [5, 10, 20, 30]
+
+        for idx, d in enumerate(plot_days):
+            ax = axes[idx // 2, idx % 2]
+            key = f"ret_{d}d"
+            vals = np.array([m["future_rets"].get(key, np.nan) for m in subset])
+            vals = vals[~np.isnan(vals)] * 100
+
+            if len(vals) > 0:
+                bins = max(8, min(30, len(vals) // 3))
+                ax.hist(vals, bins=bins, color='steelblue', edgecolor='white', alpha=0.85)
+                mean_val = np.mean(vals)
+                ax.axvline(x=mean_val, color='#e74c3c', linestyle='--', linewidth=1.8,
+                           label=f'Mean: {mean_val:.2f}%')
+                ax.axvline(x=0, color='gray', linestyle='-', linewidth=0.8)
+                ax.set_title(f'{d}-Day Return Distribution ({largest_group}, n={len(vals)})', fontsize=11)
+                ax.set_xlabel('Return (%)')
+                ax.set_ylabel('Count')
+                ax.legend(fontsize=8)
+                ax.grid(True, alpha=0.2)
+
+        plt.tight_layout()
+        dist_path = os.path.join(save_dir, f"{q['ts_code']}_{q['window_size']}w_dist.png")
+        fig.savefig(dist_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"收益分布: {dist_path}")
 
 
 def main():

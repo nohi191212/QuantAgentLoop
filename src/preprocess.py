@@ -1,6 +1,8 @@
 """
 数据预处理: 将所有股票日线按 N 周窗口切片, 编码为向量, 计算未来 1~30 日收益
 一次处理一只股票, 所有窗口大小一起产出, 避免重复加载 CSV
+
+支持多进程并行: --workers N  (默认 1 = 顺序)
 """
 import os
 import sys
@@ -88,95 +90,144 @@ def make_windows(df, window_size):
     return windows
 
 
-def compute_future_rets(df, after_idx):
-    """计算窗口之后 1~30 个交易日的累计收益率"""
-    future = df.iloc[after_idx + 1: after_idx + 1 + FUTURE_DAYS]
-    n_actual = len(future)
-    last_close = df.iloc[after_idx]["close"]
-
-    rets = np.full(FUTURE_DAYS, np.nan, dtype=np.float32)
-    if n_actual > 0 and last_close > 0:
-        cum_ret = 1.0
-        for i, (_, row) in enumerate(future.iterrows()):
-            if i >= FUTURE_DAYS:
-                break
-            daily_r = row["pct_chg"] / 100.0 if not pd.isna(row["pct_chg"]) else 0.0
-            cum_ret *= (1.0 + daily_r)
-            rets[i] = cum_ret - 1.0
-    return rets
-
-
-def process_one_stock(csv_path, encoder, accumulators):
+def precompute_all_future_rets(df, future_days=30):
     """
-    处理单只股票: 对所有窗口大小生成样本 + 向量 + 未来收益
-    accumulators: dict[window_size -> {"vectors":[], "meta":[]}]
+    一次性预计算所有位置的未来累计收益矩阵。
+    用 cumsum(log(1+r)) 向量化, O(N * future_days) → O(N + future_days)。
+    返回 (N, future_days) 的 float32 数组, rets[i, d] = 从 i 之后第 d+1 天的累计收益。
+    """
+    pct = df["pct_chg"].to_numpy(dtype=np.float64)
+    pct = np.nan_to_num(pct, nan=0.0) / 100.0
+    n = len(pct)
+
+    log_r = np.log(1.0 + pct)
+    # prefix[t] = sum_{k=0}^{t-1} log(1+r_k),   prefix[0] = 0
+    prefix = np.zeros(n + 1, dtype=np.float64)
+    prefix[1:] = np.cumsum(log_r)
+
+    i_idx = np.arange(n)[:, None]            # (N, 1)
+    d_idx = np.arange(future_days)[None, :]   # (1, 30)
+
+    start = i_idx + 1                         # 第一个未来日的 prefix 起点
+    end = i_idx + d_idx + 2                   # 最后未来日 + 1 的 prefix 终点
+
+    valid = end <= n
+    end_safe = np.clip(end, 0, n)
+
+    log_cum = np.where(valid, prefix[end_safe] - prefix[start], np.nan)
+    rets = np.exp(log_cum) - 1.0
+    return rets.astype(np.float32)
+
+
+# 预构建 ret 列名, 避免循环内重复 f-string
+_RET_COLS = {d: f"ret_{d}d" for d in range(1, FUTURE_DAYS + 1)}
+
+
+def process_one_stock(csv_path, encoder):
+    """
+    处理单只股票: 对所有窗口大小生成样本 + 向量 + 未来收益.
+    返回 (n_windows, results_dict) 其中 results_dict: {ws: {"vectors": [...], "meta": [...]}}
     """
     ts_code = os.path.basename(csv_path).replace(".csv", "")
 
     try:
         df = load_and_clean(csv_path)
     except Exception:
-        return 0
+        return 0, {}
 
     if len(df) < 30:  # 太短的股票跳过
-        return 0
+        return 0, {}
 
     df = assign_iso_week(df)
 
     # 将需要的列转为 numpy 加速, 缺失列填 NaN
-    avail_cols = [c for c in ENCODER_COLS if c in df.columns]
-    missing = [c for c in ENCODER_COLS if c not in df.columns]
-    for c in missing:
-        df[c] = np.nan
+    for c in ENCODER_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
     arr = df[ENCODER_COLS].to_numpy(dtype=np.float32)
     dates = df["trade_date"].dt.strftime("%Y%m%d").to_numpy()
 
+    # 预计算所有位置的未来收益矩阵 (N, 30), O(1) 查表
+    future_mat = precompute_all_future_rets(df, FUTURE_DAYS)
+
     total_windows = 0
+    results = {}
+    max_batch_size = 256  # 可根据显存/Gpu内存调整
 
     for ws in WINDOW_SIZES:
         windows = make_windows(df, ws)
+        if not windows:
+            continue
+
+        # 批量准备：收集所有窗口数据和元信息
+        batch_windows = []
+        batch_metas = []
+
         for _, anchor_date, start_idx, end_idx in windows:
-            # 窗口内数据
             win_arr = arr[start_idx: end_idx + 1]
+            batch_windows.append(win_arr)
 
-            # 编码
-            vec = encoder.encode(win_arr)
-
-            # 未来收益
-            future_rets = compute_future_rets(df, end_idx)
-
-            # 样本ID
-            sample_id = f"{ts_code}_{ws}w_{anchor_date}"
-
-            accumulators[ws]["vectors"].append(vec)
-            accumulators[ws]["meta"].append({
-                "sample_id": sample_id,
+            # 未来收益 — O(1) 查表
+            row = future_mat[end_idx]
+            meta = {
+                "sample_id": f"{ts_code}_{ws}w_{anchor_date}",
                 "ts_code": ts_code,
                 "window_size": ws,
                 "anchor_date": anchor_date,
                 "window_start": dates[start_idx],
                 "window_end": dates[end_idx],
-                **{f"ret_{d}d": future_rets[d - 1] for d in range(1, FUTURE_DAYS + 1)},
-            })
-            total_windows += 1
+            }
+            for d in range(1, FUTURE_DAYS + 1):
+                meta[_RET_COLS[d]] = row[d - 1]
+            batch_metas.append(meta)
 
-    return total_windows
+        ws_vectors = []
+        ws_metas = []
+
+        # 分批编码
+        for batch_start in range(0, len(batch_windows), max_batch_size):
+            batch_end = min(batch_start + max_batch_size, len(batch_windows))
+            current_batch = batch_windows[batch_start:batch_end]
+            current_metas = batch_metas[batch_start:batch_end]
+
+            vecs = encoder.encode(current_batch)  # (b, 256)
+            for i in range(vecs.shape[0]):
+                ws_vectors.append(vecs[i])
+            ws_metas.extend(current_metas)
+            total_windows += len(current_batch)
+
+        results[ws] = {"vectors": ws_vectors, "meta": ws_metas}
+
+    return total_windows, results
 
 
-def main(limit_stocks=None):
+# ======================== 多进程支持 ========================
+
+_worker_encoder = None
+
+
+def _worker_init():
+    """多进程 worker 初始化：每个进程加载自己的编码器。"""
+    global _worker_encoder
+    import torch
+    torch.set_num_threads(1)  # 限制 PyTorch 内部线程数, 靠进程数来并行
+    _worker_encoder = KronosEncoder(device='cpu')
+
+
+def _worker_process_stock(csv_path):
+    """多进程 worker: 处理一只股票, 返回 (n_windows, results_dict)。"""
+    global _worker_encoder
+    return process_one_stock(csv_path, _worker_encoder)
+
+
+# ======================== 主函数 ========================
+
+def main(limit_stocks=None, n_workers=1):
     """
     主函数, 处理所有股票.
     limit_stocks: 限制股票数量（None=全部, 用于测试）
+    n_workers: 并行进程数 (1 = 顺序, >1 = 多进程)
     """
-    encoder = KronosEncoder()
-    print(f"编码器: {encoder.name}, 维度: {encoder.dim}")
-    print(f"窗口大小: {WINDOW_SIZES}")
-    print(f"股票数据目录: {STOCK_DATA_DIR}")
-    print()
-
-    # 初始化累加器
-    accumulators = {ws: {"vectors": [], "meta": []} for ws in WINDOW_SIZES}
-
     # 获取股票列表
     csv_files = sorted(
         f for f in os.listdir(STOCK_DATA_DIR) if f.endswith(".csv")
@@ -184,24 +235,64 @@ def main(limit_stocks=None):
     if limit_stocks:
         csv_files = csv_files[:limit_stocks]
 
-    total_csv = len(csv_files)
+    csv_paths = [os.path.join(STOCK_DATA_DIR, f) for f in csv_files]
+    total_csv = len(csv_paths)
+
+    print(f"编码器: KronosMini, 维度: 256")
+    print(f"窗口大小: {WINDOW_SIZES}")
+    print(f"股票数据目录: {STOCK_DATA_DIR}")
+    print(f"股票数量: {total_csv}")
+    print(f"并行进程: {n_workers}")
+    print()
+
+    # 初始化累加器
+    accumulators = {ws: {"vectors": [], "meta": []} for ws in WINDOW_SIZES}
+
     total_windows = 0
     start_time = time.time()
 
-    from tqdm import tqdm
-    for i, fname in tqdm(enumerate(csv_files)):
-        csv_path = os.path.join(STOCK_DATA_DIR, fname)
-        n_windows = process_one_stock(csv_path, encoder, accumulators)
-        total_windows += n_windows
+    if n_workers <= 1:
+        # ——— 顺序模式 ———
+        encoder = KronosEncoder(device='cpu')
+        from tqdm import tqdm
+        for i, csv_path in tqdm(enumerate(csv_paths)):
+            n_windows, results = process_one_stock(csv_path, encoder)
+            total_windows += n_windows
+            for ws, data in results.items():
+                accumulators[ws]["vectors"].extend(data["vectors"])
+                accumulators[ws]["meta"].extend(data["meta"])
 
-        if (i + 1) % 500 == 0 or (i + 1) == total_csv:
-            elapsed = time.time() - start_time
-            print(
-                f"  股票: {i + 1}/{total_csv} "
-                f"| 累计窗口: {total_windows:,} "
-                f"| 耗时: {elapsed/60:.1f}min "
-                f"| 速度: {(i+1)/elapsed:.1f} 只/秒"
-            )
+            if (i + 1) % 500 == 0 or (i + 1) == total_csv:
+                elapsed = time.time() - start_time
+                print(
+                    f"  股票: {i + 1}/{total_csv} "
+                    f"| 累计窗口: {total_windows:,} "
+                    f"| 耗时: {elapsed/60:.1f}min "
+                    f"| 速度: {(i+1)/elapsed:.1f} 只/秒"
+                )
+    else:
+        # ——— 多进程模式 ———
+        from multiprocessing import get_context
+        from tqdm import tqdm
+
+        ctx = get_context("spawn")
+        with ctx.Pool(processes=n_workers, initializer=_worker_init) as pool:
+            with tqdm(total=total_csv, desc="处理股票") as pbar:
+                for n_windows, results in pool.imap_unordered(
+                    _worker_process_stock, csv_paths
+                ):
+                    total_windows += n_windows
+                    for ws, data in results.items():
+                        accumulators[ws]["vectors"].extend(data["vectors"])
+                        accumulators[ws]["meta"].extend(data["meta"])
+
+                    pbar.update(1)
+                    if pbar.n % 500 == 0 or pbar.n == total_csv:
+                        elapsed = time.time() - start_time
+                        pbar.set_postfix({
+                            "windows": f"{total_windows:,}",
+                            "time": f"{elapsed/60:.1f}min",
+                        })
 
     # ——— 保存 ———
     print(f"\n处理完成, 共 {total_windows:,} 个窗口, 开始保存...")
@@ -241,5 +332,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None,
                         help="限制股票数量（调试用）")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="并行进程数 (默认 1 = 顺序)")
     args = parser.parse_args()
-    main(limit_stocks=args.limit)
+    main(limit_stocks=args.limit, n_workers=args.workers)
